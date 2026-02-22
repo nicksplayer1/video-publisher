@@ -12,7 +12,9 @@ export async function POST() {
     .lte("scheduled_at", now)
     .limit(10);
 
-  if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+  if (error) {
+    return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+  }
 
   if (!posts || posts.length === 0) {
     return NextResponse.json({ ok: true, ran: 0 });
@@ -47,4 +49,9 @@ export async function POST() {
   }
 
   return NextResponse.json({ ok: true, ran: posts.length });
+}
+
+// ✅ permite rodar no navegador e facilita Cron (GET)
+export async function GET() {
+  return POST();
 }
