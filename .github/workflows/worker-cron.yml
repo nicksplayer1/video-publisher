@@ -1,4 +1,4 @@
-name: Worker Cron
+ name: Worker Cron
 
 on:
   schedule:
