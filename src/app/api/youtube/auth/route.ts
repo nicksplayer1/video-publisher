@@ -8,12 +8,7 @@ export async function GET() {
 
   if (!clientId || !redirectUri) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing env vars",
-        hasClientId: !!clientId,
-        hasRedirectUri: !!redirectUri,
-      },
+      { ok: false, error: "Missing GOOGLE_CLIENT_ID or GOOGLE_REDIRECT_URI" },
       { status: 500 }
     );
   }
@@ -27,8 +22,8 @@ export async function GET() {
   url.searchParams.set("client_id", clientId);
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("access_type", "offline"); // refresh_token
-  url.searchParams.set("prompt", "consent"); // força refresh_token na 1ª vez
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("prompt", "consent");
   url.searchParams.set("scope", scopes.join(" "));
   url.searchParams.set("include_granted_scopes", "true");
 
