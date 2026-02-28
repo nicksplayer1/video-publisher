@@ -5,48 +5,37 @@ import { getYoutubeRefreshToken } from "@/lib/youtube-token";
 import { Readable } from "node:stream";
 
 export const runtime = "nodejs";
-
-// muda esse texto quando fizer deploy pra confirmar que a Vercel atualizou
-const WORKER_VERSION = "worker-v3-debug";
+const WORKER_VERSION = "worker-v4-null-safe";
 
 function unauthorized() {
   return NextResponse.json({ ok: false, error: "Unauthorized", version: WORKER_VERSION }, { status: 401 });
 }
 
 function extractStoragePath(videoPath: string) {
-  // Aceita:
-  // - uploads/xxx.mp4
-  // - https://.../object/sign/videos/uploads/xxx.mp4?token=...
-  // - https://.../object/videos/uploads/xxx.mp4
-  // - https://.../storage/v1/object/sign/videos/uploads/xxx.mp4?... etc
-  let path = videoPath.trim();
+  let path = (videoPath ?? "").trim();
+
+  if (!path) return "";
 
   if (path.startsWith("http")) {
-    // pega tudo depois de /videos/
     const m = path.match(/\/videos\/(.+?)(\?|$)/);
     if (m?.[1]) path = m[1];
   }
 
-  // garante que não vem com / no início
-  path = path.replace(/^\/+/, "");
-
-  return path;
+  return path.replace(/^\/+/, "");
 }
 
 async function downloadFromStorage(videoPath: string) {
   const path = extractStoragePath(videoPath);
+  if (!path) throw new Error("video_path empty/invalid");
 
-  // ✅ seu bucket é "videos"
   const { data, error } = await supabaseAdmin.storage.from("videos").download(path);
   if (error) throw new Error(`storage.download: ${error.message} (path=${path})`);
 
-  // data é Blob
   const arrayBuffer = await data.arrayBuffer();
   return Buffer.from(arrayBuffer);
 }
 
 export async function POST(req: Request) {
-  // ✅ AUTH DO WORKER
   const expected = process.env.WORKER_SECRET;
   if (!expected) {
     return NextResponse.json(
@@ -60,26 +49,31 @@ export async function POST(req: Request) {
 
   const nowIso = new Date().toISOString();
 
-  // 1) Pega targets do youtube queued
-  const { data: targets, error: tErr } = await supabaseAdmin
+  // 1) pega targets youtube queued (já filtrando post_id NOT NULL)
+  const { data: targetsRaw, error: tErr } = await supabaseAdmin
     .from("post_targets")
     .select("id, post_id, platform, status, attempts")
     .eq("platform", "youtube")
     .eq("status", "queued")
-    .limit(10);
+    .not("post_id", "is", null)
+    .limit(20);
 
   if (tErr) {
     return NextResponse.json({ ok: false, error: tErr.message, version: WORKER_VERSION }, { status: 500 });
   }
 
-  if (!targets || targets.length === 0) {
-    return NextResponse.json(
-      { ok: true, ran: 0, version: WORKER_VERSION, debug: { targetsFound: 0, postsEligible: 0, targetsEligible: 0 } },
-      { status: 200 }
-    );
+  const targets = (targetsRaw ?? []).filter((t) => !!t.post_id);
+
+  if (targets.length === 0) {
+    return NextResponse.json({
+      ok: true,
+      ran: 0,
+      version: WORKER_VERSION,
+      debug: { nowIso, targetsFound: 0, postsEligible: 0, targetsEligible: 0 },
+    });
   }
 
-  // 2) Busca posts desses targets que estão elegíveis (queued e scheduled_at <= now)
+  // 2) busca posts elegíveis
   const postIds = targets.map((t) => t.post_id);
 
   const { data: posts, error: pErr } = await supabaseAdmin
@@ -94,29 +88,23 @@ export async function POST(req: Request) {
   }
 
   const postById = new Map(posts?.map((p) => [p.id, p]) ?? []);
-
-  // Targets realmente elegíveis = tem post elegível
   const eligibleTargets = targets.filter((t) => postById.has(t.post_id));
 
-  // ✅ Debug: se ficar ran 0, você vai ver onde travou
   if (eligibleTargets.length === 0) {
-    return NextResponse.json(
-      {
-        ok: true,
-        ran: 0,
-        version: WORKER_VERSION,
-        debug: {
-          targetsFound: targets.length,
-          postsEligible: posts?.length ?? 0,
-          targetsEligible: 0,
-          nowIso,
-        },
+    return NextResponse.json({
+      ok: true,
+      ran: 0,
+      version: WORKER_VERSION,
+      debug: {
+        nowIso,
+        targetsFound: targets.length,
+        postsEligible: posts?.length ?? 0,
+        targetsEligible: 0,
       },
-      { status: 200 }
-    );
+    });
   }
 
-  // 3) auth youtube (refresh_token -> client)
+  // 3) auth youtube
   const refreshToken = await getYoutubeRefreshToken();
   const yt = getYoutubeClient(refreshToken);
 
@@ -126,26 +114,20 @@ export async function POST(req: Request) {
     const post = postById.get(t.post_id)!;
 
     try {
-      // marca processing (e trava corrida)
+      // lock: só processa se ainda estiver queued
       const { error: lockErr } = await supabaseAdmin
         .from("post_targets")
         .update({ status: "processing", error: null })
         .eq("id", t.id)
         .eq("status", "queued");
 
-      if (lockErr) {
-        // se não conseguiu travar, pula
-        continue;
-      }
+      if (lockErr) continue;
 
-      // baixa o vídeo do storage
       const videoBuffer = await downloadFromStorage(post.video_path);
 
-      // ✅ ESSA é a correção do "pipe is not a function"
-      // googleapis espera stream (pipe)
+      // ✅ correção do pipe: stream
       const stream = Readable.from(videoBuffer);
 
-      // upload youtube
       const res = await yt.videos.insert({
         part: ["snippet", "status"],
         requestBody: {
@@ -182,6 +164,7 @@ export async function POST(req: Request) {
     ran,
     version: WORKER_VERSION,
     debug: {
+      nowIso,
       targetsFound: targets.length,
       postsEligible: posts?.length ?? 0,
       targetsEligible: eligibleTargets.length,
