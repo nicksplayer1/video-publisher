@@ -1,11 +1,11 @@
- import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { getYoutubeClient } from "@/lib/youtube-client";
 import { getYoutubeRefreshToken } from "@/lib/youtube-token";
 import { Readable } from "node:stream";
 
 export const runtime = "nodejs";
-const WORKER_VERSION = "worker-v4-null-safe";
+const WORKER_VERSION = "worker-v5-finalize-posts";
 
 function unauthorized() {
   return NextResponse.json({ ok: false, error: "Unauthorized", version: WORKER_VERSION }, { status: 401 });
@@ -13,9 +13,9 @@ function unauthorized() {
 
 function extractStoragePath(videoPath: string) {
   let path = (videoPath ?? "").trim();
-
   if (!path) return "";
 
+  // se vier URL pública do supabase, tenta extrair /videos/<path>
   if (path.startsWith("http")) {
     const m = path.match(/\/videos\/(.+?)(\?|$)/);
     if (m?.[1]) path = m[1];
@@ -33,6 +33,64 @@ async function downloadFromStorage(videoPath: string) {
 
   const arrayBuffer = await data.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+function buildTitleFromCaption(caption: string | null) {
+  const c = (caption ?? "").trim();
+  if (!c) return "Video";
+
+  // usa a primeira linha como título, e limita (YouTube aceita bem mais, mas aqui é seguro)
+  const firstLine = c.split("\n")[0].trim();
+  return (firstLine || "Video").slice(0, 90);
+}
+
+async function finalizePosts(postIds: string[]) {
+  const unique = Array.from(new Set(postIds)).filter(Boolean);
+  if (unique.length === 0) return;
+
+  // Pega todos os targets desses posts e decide o status final
+  const { data: allTargets, error } = await supabaseAdmin
+    .from("post_targets")
+    .select("post_id, status")
+    .in("post_id", unique);
+
+  if (error) return; // não mata o worker por causa disso
+
+  const byPost = new Map<string, string[]>();
+  for (const t of allTargets ?? []) {
+    const pid = t.post_id as string | null;
+    if (!pid) continue;
+    const arr = byPost.get(pid) ?? [];
+    arr.push(String(t.status));
+    byPost.set(pid, arr);
+  }
+
+  for (const pid of unique) {
+    const statuses = byPost.get(pid) ?? [];
+
+    // Se não tem targets, não mexe
+    if (statuses.length === 0) continue;
+
+    const stillRunning = statuses.some((s) => s === "queued" || s === "processing");
+    if (stillRunning) continue;
+
+    const allPublished = statuses.every((s) => s === "published");
+    const allFailed = statuses.every((s) => s === "failed");
+
+    let finalStatus: "published" | "failed" | "partial";
+    if (allPublished) finalStatus = "published";
+    else if (allFailed) finalStatus = "failed";
+    else finalStatus = "partial";
+
+    await supabaseAdmin
+      .from("posts")
+      .update({
+        status: finalStatus,
+        // se sua tabela tiver published_at, ótimo; se não tiver, remova esta linha
+        published_at: new Date().toISOString(),
+      })
+      .eq("id", pid);
+  }
 }
 
 export async function POST(req: Request) {
@@ -74,7 +132,7 @@ export async function POST(req: Request) {
   }
 
   // 2) busca posts elegíveis
-  const postIds = targets.map((t) => t.post_id);
+  const postIds = targets.map((t) => t.post_id as string);
 
   const { data: posts, error: pErr } = await supabaseAdmin
     .from("posts")
@@ -88,7 +146,7 @@ export async function POST(req: Request) {
   }
 
   const postById = new Map(posts?.map((p) => [p.id, p]) ?? []);
-  const eligibleTargets = targets.filter((t) => postById.has(t.post_id));
+  const eligibleTargets = targets.filter((t) => postById.has(t.post_id as string));
 
   if (eligibleTargets.length === 0) {
     return NextResponse.json({
@@ -109,9 +167,11 @@ export async function POST(req: Request) {
   const yt = getYoutubeClient(refreshToken);
 
   let ran = 0;
+  const touchedPostIds: string[] = [];
 
   for (const t of eligibleTargets) {
-    const post = postById.get(t.post_id)!;
+    const postId = t.post_id as string;
+    const post = postById.get(postId)!;
 
     try {
       // lock: só processa se ainda estiver queued
@@ -128,12 +188,15 @@ export async function POST(req: Request) {
       // ✅ correção do pipe: stream
       const stream = Readable.from(videoBuffer);
 
+      const caption = (post.caption ?? "").trim();
+      const title = buildTitleFromCaption(post.caption ?? null);
+
       const res = await yt.videos.insert({
         part: ["snippet", "status"],
         requestBody: {
           snippet: {
-            title: (post.caption ?? "Video").slice(0, 90),
-            description: post.caption ?? "",
+            title,
+            description: caption,
           },
           status: { privacyStatus: "public" },
         },
@@ -149,6 +212,7 @@ export async function POST(req: Request) {
         .eq("id", t.id);
 
       ran++;
+      touchedPostIds.push(postId);
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : JSON.stringify(e);
 
@@ -156,8 +220,13 @@ export async function POST(req: Request) {
         .from("post_targets")
         .update({ status: "failed", error: msg, attempts: (t.attempts ?? 0) + 1 })
         .eq("id", t.id);
+
+      touchedPostIds.push(postId);
     }
   }
+
+  // ✅ 4) fecha posts (atualiza posts.status quando todos targets terminaram)
+  await finalizePosts(touchedPostIds);
 
   return NextResponse.json({
     ok: true,
@@ -168,6 +237,7 @@ export async function POST(req: Request) {
       targetsFound: targets.length,
       postsEligible: posts?.length ?? 0,
       targetsEligible: eligibleTargets.length,
+      finalizedPosts: Array.from(new Set(touchedPostIds)).length,
     },
   });
 }
