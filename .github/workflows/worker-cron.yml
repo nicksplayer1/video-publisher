@@ -1,6 +1,17 @@
-- name: Call worker endpoint
-  run: |
-    echo "Calling: ${{ secrets.WORKER_URL }}"
-    curl -i -sS -X POST \
-      -H "x-worker-secret: ${{ secrets.WORKER_SECRET }}" \
-      "${{ secrets.WORKER_URL }}"
+ name: Worker Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call worker endpoint
+        run: |
+          echo "Calling: ${{ secrets.WORKER_URL }}"
+          curl -i -sS -X POST \
+            -H "x-worker-secret: ${{ secrets.WORKER_SECRET }}" \
+            "${{ secrets.WORKER_URL }}"
