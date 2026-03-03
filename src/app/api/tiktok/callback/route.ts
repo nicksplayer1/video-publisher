@@ -1,3 +1,4 @@
+ // src/app/api/tiktok/callback/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
@@ -23,6 +24,7 @@ export async function GET(req: NextRequest) {
       error_description,
     });
 
+    // Erro direto do redirect
     if (error) {
       return NextResponse.json(
         { ok: false, where: "tiktok_redirect", error, error_description },
@@ -46,9 +48,9 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const clientKey = process.env.TIKTOK_CLIENT_KEY;
-    const clientSecret = process.env.TIKTOK_CLIENT_SECRET;
-    const redirectUri = process.env.TIKTOK_REDIRECT_URI;
+    const clientKey = process.env.TIKTOK_CLIENT_KEY?.trim();
+    const clientSecret = process.env.TIKTOK_CLIENT_SECRET?.trim();
+    const redirectUri = process.env.TIKTOK_REDIRECT_URI?.trim();
 
     console.log("[tiktok/callback] env check", {
       clientKey: redact(clientKey),
@@ -63,32 +65,27 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // ✅ Token exchange via query (evita error_code 10002 "Parameter error")
-    const tokenUrl =
-      "https://open-api.tiktok.com/oauth/access_token/?" +
-      new URLSearchParams({
-        client_key: clientKey,
-        client_secret: clientSecret,
-        code,
-        grant_type: "authorization_code",
-        redirect_uri: redirectUri,
-      }).toString();
-
-    console.log("[tiktok/callback] exchanging code for token (GET)...", {
-      tokenUrlPreview: tokenUrl.slice(0, 140) + "...",
-      code: redact(code),
+    // ✅ OAuth v2 token exchange (CORRETO para /v2/auth/authorize)
+    // POST https://open.tiktokapis.com/v2/oauth/token/
+    const body = new URLSearchParams({
+      client_key: clientKey,
+      client_secret: clientSecret,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
     });
 
-    const tokenRes = await fetch(tokenUrl, { method: "GET" });
+    const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
 
     const rawText = await tokenRes.text();
     let tokenJson: any = null;
-
     try {
       tokenJson = JSON.parse(rawText);
-    } catch {
-      // keep rawText
-    }
+    } catch {}
 
     console.log("[tiktok/callback] token response", {
       ok: tokenRes.ok,
@@ -96,12 +93,8 @@ export async function GET(req: NextRequest) {
       bodyPreview: rawText?.slice(0, 500),
     });
 
-    // Trata erro do TikTok (mesmo que HTTP 200 às vezes vem com message:error)
-    const data = tokenJson?.data;
-    const tikTokErrorCode = data?.error_code;
-    const tikTokDescription = data?.description;
-
-    if (!tokenRes.ok || tokenJson?.error || tikTokErrorCode) {
+    // Se veio erro no formato OAuth v2: { error, error_description, log_id }
+    if (!tokenRes.ok || tokenJson?.error) {
       return NextResponse.json(
         {
           ok: false,
@@ -113,12 +106,13 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Formato comum: { data: { access_token, refresh_token, expires_in, open_id, scope... }, message: "success" }
-    const access_token = data?.access_token || tokenJson?.access_token;
-    const refresh_token = data?.refresh_token || tokenJson?.refresh_token;
-    const expires_in = data?.expires_in || tokenJson?.expires_in;
-    const open_id = data?.open_id || tokenJson?.open_id;
-    const scope = data?.scope || data?.scopes || tokenJson?.scope || tokenJson?.scopes;
+    // Resposta v2 normalmente inclui: open_id, scope, access_token, expires_in, refresh_token...
+    const access_token = tokenJson?.access_token;
+    const refresh_token = tokenJson?.refresh_token;
+    const expires_in = tokenJson?.expires_in;
+    const open_id = tokenJson?.open_id;
+    const scope = tokenJson?.scope;
+    const token_type = tokenJson?.token_type;
 
     if (!access_token) {
       return NextResponse.json(
@@ -145,7 +139,8 @@ export async function GET(req: NextRequest) {
           refresh_token: refresh_token ?? null,
           expires_at,
           open_id: open_id ?? null,
-          scope: typeof scope === "string" ? scope : JSON.stringify(scope ?? null),
+          scope: scope ?? null,
+          token_type: token_type ?? null,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "id" }
@@ -164,6 +159,7 @@ export async function GET(req: NextRequest) {
       connected: true,
       open_id: open_id ?? null,
       expires_at,
+      scope: scope ?? null,
     });
   } catch (e: any) {
     console.log("[tiktok/callback] unhandled error", e);
