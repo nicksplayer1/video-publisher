@@ -1,7 +1,7 @@
  import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
-// GET só pra você testar no browser e confirmar que a rota existe no deploy
+// GET só pra testar no browser e confirmar que a rota existe no deploy
 export async function GET() {
   return NextResponse.json({ ok: true, route: "/api/tiktok/post/init", method: "GET" });
 }
@@ -57,12 +57,13 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const video_size = arrayBuffer.byteLength;
 
-    // 3) chunk config
-    const chunk =
+    // 3) chunk config (TikTok NÃO aceita chunk_size > video_size)
+    const desired =
       typeof chunk_size === "number" && chunk_size > 0
         ? chunk_size
         : 10 * 1024 * 1024; // 10MB
 
+    const chunk = Math.min(desired, video_size);
     const total_chunk_count = Math.ceil(video_size / chunk);
 
     // 4) chama o INIT do TikTok (inbox upload)
@@ -93,7 +94,8 @@ export async function POST(req: NextRequest) {
       json = JSON.parse(raw);
     } catch {}
 
-    if (!res.ok || json?.error?.code && json.error.code !== "ok") {
+    // Se TikTok responder erro dentro do JSON
+    if (!res.ok || (json?.error?.code && json.error.code !== "ok")) {
       return NextResponse.json(
         {
           ok: false,
