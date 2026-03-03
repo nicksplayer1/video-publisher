@@ -1,4 +1,4 @@
- // src/app/api/tiktok/callback/route.ts
+// src/app/api/tiktok/callback/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
@@ -23,6 +23,7 @@ export async function GET(req: NextRequest) {
       error_description,
     });
 
+    // Se o TikTok devolveu erro direto no redirect
     if (error) {
       return NextResponse.json(
         { ok: false, where: "tiktok_redirect", error, error_description },
@@ -33,6 +34,19 @@ export async function GET(req: NextRequest) {
     if (!code) {
       return NextResponse.json(
         { ok: false, where: "missing_code", error: "No code in callback" },
+        { status: 400 }
+      );
+    }
+
+    // Validar state (anti-CSRF)
+    const cookieState = req.cookies.get("tiktok_oauth_state")?.value;
+    if (!state || !cookieState || state !== cookieState) {
+      return NextResponse.json(
+        {
+          ok: false,
+          where: "state",
+          error: "Invalid state (cookie mismatch or missing)",
+        },
         { status: 400 }
       );
     }
@@ -54,7 +68,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // IMPORTANT: TikTok costuma exigir x-www-form-urlencoded.
+    // TikTok geralmente exige x-www-form-urlencoded
     const body = new URLSearchParams({
       client_key: clientKey,
       client_secret: clientSecret,
@@ -68,9 +82,8 @@ export async function GET(req: NextRequest) {
       code: redact(code),
     });
 
-    // Endpoint pode variar por produto/versão. Se você já tinha um endpoint definido, mantenha o MESMO.
-    // Aqui fica como exemplo; se seu app usa outro endpoint oficial, substitua.
-    const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+    // ✅ Endpoint alternativo (muito comum para OAuth do Login Kit)
+    const tokenRes = await fetch("https://open-api.tiktok.com/oauth/access_token/", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
@@ -82,15 +95,29 @@ export async function GET(req: NextRequest) {
     try {
       tokenJson = JSON.parse(rawText);
     } catch {
-      // se não vier JSON, loga o texto cru
+      // se não vier JSON, mantém rawText
     }
 
     console.log("[tiktok/callback] token response", {
       ok: tokenRes.ok,
       status: tokenRes.status,
-      bodyPreview: rawText?.slice(0, 300),
+      bodyPreview: rawText?.slice(0, 400),
     });
 
+    // Se a API respondeu erro em JSON
+    if (tokenJson?.error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          where: "token_exchange",
+          status: tokenRes.status,
+          response: tokenJson,
+        },
+        { status: 502 }
+      );
+    }
+
+    // Se HTTP não ok e não veio JSON parseável
     if (!tokenRes.ok) {
       return NextResponse.json(
         {
@@ -103,15 +130,17 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Ajuste conforme formato real que seu endpoint retorna
-    const access_token =
-      tokenJson?.access_token || tokenJson?.data?.access_token;
-    const refresh_token =
-      tokenJson?.refresh_token || tokenJson?.data?.refresh_token;
-    const expires_in =
-      tokenJson?.expires_in || tokenJson?.data?.expires_in;
+    // Parse flexível (algumas respostas vêm em data)
+    const access_token = tokenJson?.access_token || tokenJson?.data?.access_token;
+    const refresh_token = tokenJson?.refresh_token || tokenJson?.data?.refresh_token;
+    const expires_in = tokenJson?.expires_in || tokenJson?.data?.expires_in;
     const open_id = tokenJson?.open_id || tokenJson?.data?.open_id;
-    const scope = tokenJson?.scope || tokenJson?.data?.scope;
+
+    const scope =
+      tokenJson?.scope ||
+      tokenJson?.scopes ||
+      tokenJson?.data?.scope ||
+      tokenJson?.data?.scopes;
 
     if (!access_token) {
       return NextResponse.json(
@@ -136,10 +165,10 @@ export async function GET(req: NextRequest) {
         {
           id: "main",
           access_token,
-          refresh_token,
+          refresh_token: refresh_token ?? null,
           expires_at,
-          open_id,
-          scope: typeof scope === "string" ? scope : JSON.stringify(scope),
+          open_id: open_id ?? null,
+          scope: typeof scope === "string" ? scope : JSON.stringify(scope ?? null),
           updated_at: new Date().toISOString(),
         },
         { onConflict: "id" }
@@ -156,7 +185,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       connected: true,
-      open_id,
+      open_id: open_id ?? null,
       expires_at,
     });
   } catch (e: any) {

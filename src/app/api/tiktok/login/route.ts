@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+ import { NextResponse } from "next/server";
 
 export async function GET() {
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
