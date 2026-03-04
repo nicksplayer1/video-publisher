@@ -10,14 +10,17 @@ const WORKER_VERSION = "worker-v6-youtube+tiktok";
 /** ===== Helpers gerais ===== */
 
 function unauthorized() {
-  return NextResponse.json({ ok: false, error: "Unauthorized", version: WORKER_VERSION }, { status: 401 });
+  return NextResponse.json(
+    { ok: false, error: "Unauthorized", version: WORKER_VERSION },
+    { status: 401 }
+  );
 }
 
 function extractStoragePath(videoPath: string) {
   let path = (videoPath ?? "").trim();
   if (!path) return "";
 
-  // se vier URL pública do supabase, tenta extrair /videos/<path>
+  // Se vier URL pública do supabase, tenta extrair /videos/<path>
   if (path.startsWith("http")) {
     const m = path.match(/\/videos\/(.+?)(\?|$)/);
     if (m?.[1]) path = m[1];
@@ -93,7 +96,7 @@ async function finalizePosts(postIds: string[]) {
       .from("posts")
       .update({
         status: finalStatus,
-        // se sua tabela tiver published_at, ótimo; se não tiver, remova esta linha
+        // Se sua tabela NÃO tiver published_at, remova essa linha.
         published_at: nowIso(),
       })
       .eq("id", pid);
@@ -138,7 +141,6 @@ async function refreshTikTokAccessToken(refreshToken: string) {
   const client_key = envOrThrow("TIKTOK_CLIENT_KEY");
   const client_secret = envOrThrow("TIKTOK_CLIENT_SECRET");
 
-  // TikTok OAuth refresh (v2)
   const res = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -152,15 +154,18 @@ async function refreshTikTokAccessToken(refreshToken: string) {
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(`tiktok refresh failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
+    throw new Error(
+      `tiktok refresh failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`
+    );
   }
 
-  // campos típicos: access_token, refresh_token, expires_in, token_type, open_id, scope
   const access_token = json?.access_token as string | undefined;
   const new_refresh_token = (json?.refresh_token as string | undefined) ?? refreshToken;
   const expires_in = Number(json?.expires_in ?? 0);
 
-  if (!access_token) throw new Error(`tiktok refresh: missing access_token (${JSON.stringify(json)})`);
+  if (!access_token) {
+    throw new Error(`tiktok refresh: missing access_token (${JSON.stringify(json)})`);
+  }
 
   const newExpiresAt = expires_in > 0 ? inMs(expires_in * 1000) : inMs(55 * 60 * 1000);
 
@@ -197,22 +202,23 @@ type TikTokInitResponse = {
   total_chunk_count?: number;
 };
 
-async function tiktokInit(accessToken: string, caption: string, videoSize: number): Promise<TikTokInitResponse> {
-  // Estrutura compatível com o fluxo “FILE_UPLOAD” (Inbox / publish API)
-  // Observação: alguns apps exigem title separado; aqui usamos caption.
+async function tiktokInit(
+  accessToken: string,
+  caption: string,
+  videoSize: number
+): Promise<TikTokInitResponse> {
   const body = {
     post_info: {
-      title: (caption ?? "").slice(0, 150), // seguro
+      title: (caption ?? "").slice(0, 150),
       description: caption ?? "",
       disable_comment: false,
       disable_duet: false,
       disable_stitch: false,
-      // privacy_level pode variar por app; omitimos para defaults do usuário
     },
     source_info: {
       source: "FILE_UPLOAD",
       video_size: videoSize,
-      chunk_size: videoSize, // se a API devolver chunk_size no response, usamos depois
+      chunk_size: videoSize,
       total_chunk_count: 1,
     },
   };
@@ -229,7 +235,6 @@ async function tiktokInit(accessToken: string, caption: string, videoSize: numbe
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(`tiktok init failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
 
-  // formato típico: { data: { publish_id, upload_url, ... }, error: { code, message, ... } }
   const data = json?.data ?? json;
   const publish_id = data?.publish_id as string | undefined;
   const upload_url = data?.upload_url as string | undefined;
@@ -252,7 +257,6 @@ async function tiktokUpload(uploadUrl: string, video: Buffer, chunkSize: number)
   const cs = Math.max(1, chunkSize || size);
   let offset = 0;
 
-  // Upload por chunks (quando necessário)
   while (offset < size) {
     const end = Math.min(offset + cs, size);
     const chunk = video.subarray(offset, end);
@@ -262,10 +266,10 @@ async function tiktokUpload(uploadUrl: string, video: Buffer, chunkSize: number)
       headers: {
         "Content-Type": "video/mp4",
         "Content-Length": String(chunk.length),
-        // Muitos flows aceitam/precisam Content-Range:
         "Content-Range": `bytes ${offset}-${end - 1}/${size}`,
       },
-      body: chunk,
+      // ✅ FIX TS/Next build: Buffer -> Uint8Array (BodyInit aceito)
+      body: new Uint8Array(chunk),
     });
 
     const txt = await res.text().catch(() => "");
@@ -278,7 +282,6 @@ async function tiktokUpload(uploadUrl: string, video: Buffer, chunkSize: number)
 }
 
 async function tiktokStatus(accessToken: string, publishId: string) {
-  // Tentativa 1: GET com querystring
   const url = new URL("https://open.tiktokapis.com/v2/post/publish/status/");
   url.searchParams.set("publish_id", publishId);
 
@@ -290,7 +293,6 @@ async function tiktokStatus(accessToken: string, publishId: string) {
   const json = await res.json().catch(() => null);
   if (res.ok) return json;
 
-  // Fallback: POST (alguns apps/ambientes aceitam assim)
   const res2 = await fetch("https://open.tiktokapis.com/v2/post/publish/status/", {
     method: "POST",
     headers: {
@@ -312,14 +314,11 @@ async function publishToTikTok(params: { caption: string; video: Buffer }) {
 
   const init = await tiktokInit(access_token, params.caption, params.video.length);
 
-  // Se a API devolver chunk_size menor, respeita
   const chunkSize = init.chunk_size && init.chunk_size > 0 ? init.chunk_size : params.video.length;
   await tiktokUpload(init.upload_url, params.video, chunkSize);
 
   const st = await tiktokStatus(access_token, init.publish_id);
 
-  // status esperado no seu caso: SEND_TO_USER_INBOX
-  // Guardamos o publish_id para rastrear.
   const statusStr =
     (st?.data?.status as string | undefined) ??
     (st?.status as string | undefined) ??
@@ -338,7 +337,10 @@ async function publishToTikTok(params: { caption: string; video: Buffer }) {
 export async function POST(req: Request) {
   const expected = process.env.WORKER_SECRET;
   if (!expected) {
-    return NextResponse.json({ ok: false, error: "Missing WORKER_SECRET in env", version: WORKER_VERSION }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "Missing WORKER_SECRET in env", version: WORKER_VERSION },
+      { status: 500 }
+    );
   }
 
   const got = req.headers.get("x-worker-secret") || "";
@@ -459,13 +461,13 @@ export async function POST(req: Request) {
       if (platform === "tiktok") {
         const out = await publishToTikTok({ caption, video: videoBuffer });
 
-        // No modo inbox, o “resultado” útil é o publish_id (e status SEND_TO_USER_INBOX)
         await supabaseAdmin
           .from("post_targets")
           .update({
             status: "published",
             result_url: out.publish_id,
             published_at: nowIso(),
+            // guarda status como texto (ajuda debug). Se preferir, pode deixar null.
             error: out.status ? `TikTok:${out.status}` : null,
           })
           .eq("id", t.id);
@@ -476,7 +478,6 @@ export async function POST(req: Request) {
         continue;
       }
 
-      // se cair aqui, plataforma não suportada
       throw new Error(`Unsupported platform: ${platform}`);
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : JSON.stringify(e);
