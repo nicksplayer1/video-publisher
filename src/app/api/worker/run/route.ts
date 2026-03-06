@@ -5,7 +5,7 @@ import { getYoutubeRefreshToken } from "@/lib/youtube-token";
 import { Readable } from "node:stream";
 
 export const runtime = "nodejs";
-const WORKER_VERSION = "worker-v6-youtube+tiktok";
+const WORKER_VERSION = "worker-v7-youtube+tiktok-inbox";
 
 /** ===== Helpers gerais ===== */
 
@@ -20,7 +20,6 @@ function extractStoragePath(videoPath: string) {
   let path = (videoPath ?? "").trim();
   if (!path) return "";
 
-  // Se vier URL pública do supabase, tenta extrair /videos/<path>
   if (path.startsWith("http")) {
     const m = path.match(/\/videos\/(.+?)(\?|$)/);
     if (m?.[1]) path = m[1];
@@ -55,7 +54,7 @@ function inMs(ms: number) {
   return new Date(Date.now() + ms).toISOString();
 }
 
-/** ===== Finalização (igual seu worker) ===== */
+/** ===== Finalização ===== */
 
 async function finalizePosts(postIds: string[]) {
   const unique = Array.from(new Set(postIds)).filter(Boolean);
@@ -96,7 +95,6 @@ async function finalizePosts(postIds: string[]) {
       .from("posts")
       .update({
         status: finalStatus,
-        // Se sua tabela NÃO tiver published_at, remova essa linha.
         published_at: nowIso(),
       })
       .eq("id", pid);
@@ -108,7 +106,7 @@ async function finalizePosts(postIds: string[]) {
 type TikTokTokenRow = {
   access_token: string | null;
   refresh_token: string | null;
-  expires_at: string | null; // timestamptz
+  expires_at: string | null;
   token_type: string | null;
   open_id: string | null;
   scope: string | null;
@@ -223,7 +221,8 @@ async function tiktokInit(
     },
   };
 
-  const res = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
+  // ✅ CORREÇÃO: endpoint de Inbox, não direct publish
+  const res = await fetch("https://open.tiktokapis.com/v2/post/publish/inbox/video/init/", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -233,7 +232,9 @@ async function tiktokInit(
   });
 
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`tiktok init failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
+  if (!res.ok) {
+    throw new Error(`tiktok init failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
+  }
 
   const data = json?.data ?? json;
   const publish_id = data?.publish_id as string | undefined;
@@ -268,7 +269,6 @@ async function tiktokUpload(uploadUrl: string, video: Buffer, chunkSize: number)
         "Content-Length": String(chunk.length),
         "Content-Range": `bytes ${offset}-${end - 1}/${size}`,
       },
-      // ✅ FIX TS/Next build: Buffer -> Uint8Array (BodyInit aceito)
       body: new Uint8Array(chunk),
     });
 
@@ -282,18 +282,10 @@ async function tiktokUpload(uploadUrl: string, video: Buffer, chunkSize: number)
 }
 
 async function tiktokStatus(accessToken: string, publishId: string) {
-  const url = new URL("https://open.tiktokapis.com/v2/post/publish/status/");
+  const url = new URL("https://open.tiktokapis.com/v2/post/publish/status/fetch/");
   url.searchParams.set("publish_id", publishId);
 
   const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  const json = await res.json().catch(() => null);
-  if (res.ok) return json;
-
-  const res2 = await fetch("https://open.tiktokapis.com/v2/post/publish/status/", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -302,11 +294,11 @@ async function tiktokStatus(accessToken: string, publishId: string) {
     body: JSON.stringify({ publish_id: publishId }),
   });
 
-  const json2 = await res2.json().catch(() => null);
-  if (!res2.ok) {
-    throw new Error(`tiktok status failed: ${res2.status} ${res2.statusText} ${JSON.stringify(json2 ?? json)}`);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(`tiktok status failed: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
   }
-  return json2;
+  return json;
 }
 
 async function publishToTikTok(params: { caption: string; video: Buffer }) {
@@ -314,7 +306,9 @@ async function publishToTikTok(params: { caption: string; video: Buffer }) {
 
   const init = await tiktokInit(access_token, params.caption, params.video.length);
 
-  const chunkSize = init.chunk_size && init.chunk_size > 0 ? init.chunk_size : params.video.length;
+  const chunkSize =
+    init.chunk_size && init.chunk_size > 0 ? init.chunk_size : params.video.length;
+
   await tiktokUpload(init.upload_url, params.video, chunkSize);
 
   const st = await tiktokStatus(access_token, init.publish_id);
@@ -348,7 +342,6 @@ export async function POST(req: Request) {
 
   const now = nowIso();
 
-  // 1) pega targets queued (YouTube + TikTok)
   const { data: targetsRaw, error: tErr } = await supabaseAdmin
     .from("post_targets")
     .select("id, post_id, platform, status, attempts")
@@ -358,7 +351,10 @@ export async function POST(req: Request) {
     .limit(20);
 
   if (tErr) {
-    return NextResponse.json({ ok: false, error: tErr.message, version: WORKER_VERSION }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: tErr.message, version: WORKER_VERSION },
+      { status: 500 }
+    );
   }
 
   const targets = (targetsRaw ?? []).filter((t) => !!t.post_id);
@@ -372,7 +368,6 @@ export async function POST(req: Request) {
     });
   }
 
-  // 2) busca posts elegíveis
   const postIds = targets.map((t) => t.post_id as string);
 
   const { data: posts, error: pErr } = await supabaseAdmin
@@ -383,7 +378,10 @@ export async function POST(req: Request) {
     .lte("scheduled_at", now);
 
   if (pErr) {
-    return NextResponse.json({ ok: false, error: pErr.message, version: WORKER_VERSION }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: pErr.message, version: WORKER_VERSION },
+      { status: 500 }
+    );
   }
 
   const postById = new Map(posts?.map((p) => [p.id, p]) ?? []);
@@ -394,18 +392,21 @@ export async function POST(req: Request) {
       ok: true,
       ran: 0,
       version: WORKER_VERSION,
-      debug: { nowIso: now, targetsFound: targets.length, postsEligible: posts?.length ?? 0, targetsEligible: 0 },
+      debug: {
+        nowIso: now,
+        targetsFound: targets.length,
+        postsEligible: posts?.length ?? 0,
+        targetsEligible: 0,
+      },
     });
   }
 
-  // 3) prepara YouTube client SOMENTE se tiver target youtube
   const hasYoutube = eligibleTargets.some((t) => String(t.platform) === "youtube");
   const yt = hasYoutube ? getYoutubeClient(await getYoutubeRefreshToken()) : null;
 
   let ran = 0;
   let ranYoutube = 0;
   let ranTikTok = 0;
-
   const touchedPostIds: string[] = [];
 
   for (const t of eligibleTargets) {
@@ -414,7 +415,6 @@ export async function POST(req: Request) {
     const platform = String(t.platform);
 
     try {
-      // lock: só processa se ainda estiver queued
       const { error: lockErr } = await supabaseAdmin
         .from("post_targets")
         .update({ status: "processing", error: null })
@@ -449,7 +449,12 @@ export async function POST(req: Request) {
 
         await supabaseAdmin
           .from("post_targets")
-          .update({ status: "published", result_url: url, published_at: nowIso(), error: null })
+          .update({
+            status: "published",
+            result_url: url,
+            published_at: nowIso(),
+            error: null,
+          })
           .eq("id", t.id);
 
         ran++;
@@ -467,7 +472,6 @@ export async function POST(req: Request) {
             status: "published",
             result_url: out.publish_id,
             published_at: nowIso(),
-            // guarda status como texto (ajuda debug). Se preferir, pode deixar null.
             error: out.status ? `TikTok:${out.status}` : null,
           })
           .eq("id", t.id);
@@ -484,14 +488,17 @@ export async function POST(req: Request) {
 
       await supabaseAdmin
         .from("post_targets")
-        .update({ status: "failed", error: msg, attempts: (t.attempts ?? 0) + 1 })
+        .update({
+          status: "failed",
+          error: msg,
+          attempts: (t.attempts ?? 0) + 1,
+        })
         .eq("id", t.id);
 
       touchedPostIds.push(postId);
     }
   }
 
-  // 4) fecha posts (atualiza posts.status quando todos targets terminaram)
   await finalizePosts(touchedPostIds);
 
   return NextResponse.json({
