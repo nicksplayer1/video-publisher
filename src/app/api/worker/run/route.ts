@@ -2,10 +2,11 @@
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { getYoutubeClient } from "@/lib/youtube-client";
 import { getYoutubeRefreshToken } from "@/lib/youtube-token";
+import { publishInstagramReelFromUrl } from "@/lib/instagram-client";
 import { Readable } from "node:stream";
 
 export const runtime = "nodejs";
-const WORKER_VERSION = "worker-v7-youtube+tiktok-inbox";
+const WORKER_VERSION = "worker-v8-youtube+tiktok+instagram";
 
 /** ===== Helpers gerais ===== */
 
@@ -37,6 +38,28 @@ async function downloadFromStorage(videoPath: string) {
 
   const arrayBuffer = await data.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+async function createSignedVideoUrl(videoPath: string, expiresIn = 3600) {
+  const path = extractStoragePath(videoPath);
+  if (!path) throw new Error("video_path empty/invalid");
+
+  const { data, error } = await supabaseAdmin.storage
+    .from("videos")
+    .createSignedUrl(path, expiresIn);
+
+  if (error) {
+    throw new Error(`storage.createSignedUrl: ${error.message} (path=${path})`);
+  }
+
+  if (!data?.signedUrl) {
+    throw new Error(`storage.createSignedUrl: missing signedUrl (path=${path})`);
+  }
+
+  return {
+    path,
+    signedUrl: data.signedUrl,
+  };
 }
 
 function buildTitleFromCaption(caption: string | null) {
@@ -221,7 +244,6 @@ async function tiktokInit(
     },
   };
 
-  // ✅ CORREÇÃO: endpoint de Inbox, não direct publish
   const res = await fetch("https://open.tiktokapis.com/v2/post/publish/inbox/video/init/", {
     method: "POST",
     headers: {
@@ -345,7 +367,7 @@ export async function POST(req: Request) {
   const { data: targetsRaw, error: tErr } = await supabaseAdmin
     .from("post_targets")
     .select("id, post_id, platform, status, attempts")
-    .in("platform", ["youtube", "tiktok"])
+    .in("platform", ["youtube", "tiktok", "instagram"])
     .eq("status", "queued")
     .not("post_id", "is", null)
     .limit(20);
@@ -407,6 +429,7 @@ export async function POST(req: Request) {
   let ran = 0;
   let ranYoutube = 0;
   let ranTikTok = 0;
+  let ranInstagram = 0;
   const touchedPostIds: string[] = [];
 
   for (const t of eligibleTargets) {
@@ -424,11 +447,11 @@ export async function POST(req: Request) {
       if (lockErr) continue;
 
       const caption = (post.caption ?? "").trim();
-      const videoBuffer = await downloadFromStorage(post.video_path);
 
       if (platform === "youtube") {
         if (!yt) throw new Error("YouTube client not initialized");
 
+        const videoBuffer = await downloadFromStorage(post.video_path);
         const stream = Readable.from(videoBuffer);
         const title = buildTitleFromCaption(post.caption ?? null);
 
@@ -464,6 +487,7 @@ export async function POST(req: Request) {
       }
 
       if (platform === "tiktok") {
+        const videoBuffer = await downloadFromStorage(post.video_path);
         const out = await publishToTikTok({ caption, video: videoBuffer });
 
         await supabaseAdmin
@@ -478,6 +502,34 @@ export async function POST(req: Request) {
 
         ran++;
         ranTikTok++;
+        touchedPostIds.push(postId);
+        continue;
+      }
+
+      if (platform === "instagram") {
+        const signed = await createSignedVideoUrl(post.video_path, 3600);
+
+        const out = await publishInstagramReelFromUrl({
+          videoUrl: signed.signedUrl,
+          caption,
+          timeoutMs: 10 * 60 * 1000,
+          pollIntervalMs: 5000,
+        });
+
+        await supabaseAdmin
+          .from("post_targets")
+          .update({
+            status: "published",
+            result_url: out.permalink,
+            platform_ref: out.media_id,
+            platform_status: out.status_code,
+            published_at: nowIso(),
+            error: null,
+          })
+          .eq("id", t.id);
+
+        ran++;
+        ranInstagram++;
         touchedPostIds.push(postId);
         continue;
       }
@@ -512,6 +564,7 @@ export async function POST(req: Request) {
       targetsEligible: eligibleTargets.length,
       ranYoutube,
       ranTikTok,
+      ranInstagram,
       finalizedPosts: Array.from(new Set(touchedPostIds)).length,
     },
   });
